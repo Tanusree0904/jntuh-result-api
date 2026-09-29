@@ -3,71 +3,89 @@ const { URL } = require("url");
 
 const PORT = process.env.PORT || 10000;
 const MCP_URL = "https://jntuhresults.dhethi.com/mcp";
-const MCP_VERSION = "2025-06-18";
 
-function addCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
+const CLIENT_ORIGIN = "https://jntuhconnect.dhethi.com";
+const CLIENT_VERSION = "1.0.0";
 
-async function readResponse(response) {
+async function readMcpResponse(response) {
   const contentType =
     response.headers.get("content-type") || "";
 
   const text = await response.text();
 
-  if (contentType.includes("application/json")) {
-    let data = null;
+  let data = null;
 
+  if (contentType.includes("application/json")) {
     try {
       data = JSON.parse(text);
     } catch (_) {
       data = text;
     }
+  } else {
+    // MCP can return Server-Sent Events.
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("data:")) continue;
 
-    return {
-      data,
-      sessionId:
-        response.headers.get("mcp-session-id"),
-    };
-  }
+      const value = line.substring(5).trim();
 
-  // MCP may return Server-Sent Events.
-  let lastJson = null;
+      if (!value || value === "[DONE]") continue;
 
-  for (const line of text.split("\n")) {
-    if (!line.startsWith("data:")) {
-      continue;
+      try {
+        data = JSON.parse(value);
+      } catch (_) {}
     }
-
-    const value = line.substring(5).trim();
-
-    if (!value || value === "[DONE]") {
-      continue;
-    }
-
-    try {
-      lastJson = JSON.parse(value);
-    } catch (_) {}
   }
 
   return {
-    data: lastJson,
+    data,
     sessionId:
       response.headers.get("mcp-session-id"),
+    protocolVersion:
+      response.headers.get("mcp-protocol-version"),
+    wwwAuthenticate:
+      response.headers.get("www-authenticate"),
+    contentType,
+    raw: text,
   };
 }
 
-async function mcpPost(body, sessionId = null) {
+async function mcpPost(
+  body,
+  options = {}
+) {
+  const {
+    sessionId = null,
+    protocolVersion = "2025-06-18",
+    method = null,
+    name = null,
+  } = options;
+
   const headers = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
-    "MCP-Protocol-Version": MCP_VERSION,
+
+    // The JNTUH MCP server is intended to be accessed
+    // from the JNTUH Connect origin.
+    "Origin": CLIENT_ORIGIN,
+    "Referer": `${CLIENT_ORIGIN}/`,
+
+    "User-Agent":
+      `JNTUH-Connect-Proxy/${CLIENT_VERSION}`,
+
+    "MCP-Protocol-Version": protocolVersion,
   };
 
   if (sessionId) {
     headers["Mcp-Session-Id"] = sessionId;
+  }
+
+  // Required by newer Streamable HTTP MCP versions.
+  if (method) {
+    headers["Mcp-Method"] = method;
+  }
+
+  if (name) {
+    headers["Mcp-Name"] = name;
   }
 
   const response = await fetch(MCP_URL, {
@@ -76,74 +94,60 @@ async function mcpPost(body, sessionId = null) {
     body: JSON.stringify(body),
   });
 
-  const parsed = await readResponse(response);
+  const parsed = await readMcpResponse(response);
 
   if (!response.ok) {
+    const details = {
+      status: response.status,
+      contentType: parsed.contentType,
+      wwwAuthenticate: parsed.wwwAuthenticate,
+      body: parsed.data,
+    };
+
     throw new Error(
-      `MCP HTTP ${response.status}: ${JSON.stringify(parsed.data)}`
+      `MCP HTTP ${response.status}: ${JSON.stringify(details)}`
     );
   }
 
   return parsed;
 }
 
-function extractToolResult(rpc) {
-  const result = rpc?.result;
-
-  if (!result) {
-    return rpc;
-  }
-
-  // Some MCP servers return structured content.
-  if (result.structuredContent) {
-    return result.structuredContent;
-  }
-
-  // Standard MCP text content.
-  if (Array.isArray(result.content)) {
-    for (const item of result.content) {
-      if (
-        item &&
-        item.type === "text" &&
-        typeof item.text === "string"
-      ) {
-        try {
-          return JSON.parse(item.text);
-        } catch (_) {
-          return {
-            text: item.text,
-          };
-        }
-      }
-    }
-  }
-
-  return result;
-}
-
 async function getAcademicResult(rollNumber) {
-  // ---------------------------------------------
-  // 1. Initialize MCP session
-  // ---------------------------------------------
-  const initialized = await mcpPost({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: MCP_VERSION,
-      capabilities: {},
-      clientInfo: {
-        name: "JNTUH Flutter App",
-        version: "1.0.0",
+  // --------------------------------------------------
+  // 1. INITIALIZE
+  // --------------------------------------------------
+
+  const initialized = await mcpPost(
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: {
+          name: "JNTUH Flutter Proxy",
+          version: CLIENT_VERSION,
+        },
       },
     },
-  });
+    {
+      protocolVersion: "2025-06-18",
+      method: "initialize",
+    }
+  );
 
   const sessionId = initialized.sessionId;
 
-  // ---------------------------------------------
-  // 2. Initialization notification
-  // ---------------------------------------------
+  // Use the version negotiated by the server when available.
+  const negotiatedVersion =
+    initialized.protocolVersion ||
+    "2025-06-18";
+
+  // --------------------------------------------------
+  // 2. INITIALIZED NOTIFICATION
+  // --------------------------------------------------
+
   if (sessionId) {
     await mcpPost(
       {
@@ -151,20 +155,61 @@ async function getAcademicResult(rollNumber) {
         method: "notifications/initialized",
         params: {},
       },
-      sessionId
+      {
+        sessionId,
+        protocolVersion: negotiatedVersion,
+        method: "notifications/initialized",
+      }
     );
   }
 
-  // ---------------------------------------------
-  // 3. Call the CURRENT tool
-  //
-  // Important:
-  // The backend uses roll_no, not rollNumber.
-  // ---------------------------------------------
-  const toolResponse = await mcpPost(
+  // --------------------------------------------------
+  // 3. DISCOVER TOOLS
+  // --------------------------------------------------
+
+  const toolsResponse = await mcpPost(
     {
       jsonrpc: "2.0",
       id: 2,
+      method: "tools/list",
+      params: {},
+    },
+    {
+      sessionId,
+      protocolVersion: negotiatedVersion,
+      method: "tools/list",
+    }
+  );
+
+  const tools =
+    toolsResponse.data?.result?.tools || [];
+
+  console.log(
+    "TOOLS:",
+    tools.map((tool) => tool.name)
+  );
+
+  const academicTool = tools.find(
+    (tool) =>
+      tool.name === "get_academic_result"
+  );
+
+  if (!academicTool) {
+    throw new Error(
+      `get_academic_result tool not found. Available tools: ${tools
+        .map((tool) => tool.name)
+        .join(", ")}`
+    );
+  }
+
+  // --------------------------------------------------
+  // 4. CALL get_academic_result
+  // --------------------------------------------------
+
+  const resultResponse = await mcpPost(
+    {
+      jsonrpc: "2.0",
+      id: 3,
       method: "tools/call",
       params: {
         name: "get_academic_result",
@@ -173,122 +218,169 @@ async function getAcademicResult(rollNumber) {
         },
       },
     },
-    sessionId
+    {
+      sessionId,
+      protocolVersion: negotiatedVersion,
+      method: "tools/call",
+      name: "get_academic_result",
+    }
   );
 
-  if (toolResponse.data?.error) {
+  if (resultResponse.data?.error) {
     throw new Error(
-      JSON.stringify(toolResponse.data.error)
+      JSON.stringify(
+        resultResponse.data.error
+      )
     );
   }
 
-  return extractToolResult(toolResponse.data);
+  return resultResponse.data;
 }
 
-const server = http.createServer(async (req, res) => {
-  addCors(res);
-
-  // Browser CORS preflight
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const requestUrl = new URL(
-    req.url,
-    `http://${req.headers.host}`
+function addCors(res) {
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
   );
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, OPTIONS"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type"
+  );
+}
 
-  // Health check
-  if (
-    requestUrl.pathname === "/" &&
-    req.method === "GET"
-  ) {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-    });
+const server = http.createServer(
+  async (req, res) => {
+    addCors(res);
 
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        service: "JNTUH Flutter Result Proxy",
-      })
+    // Browser preflight
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const requestUrl = new URL(
+      req.url,
+      `http://${req.headers.host}`
     );
 
-    return;
-  }
+    // ----------------------------------------------
+    // HEALTH CHECK
+    // ----------------------------------------------
 
-  // Result endpoint
-  if (
-    requestUrl.pathname === "/api/result" &&
-    req.method === "GET"
-  ) {
-    const rollNumber = (
-      requestUrl.searchParams.get("rollNumber") || ""
-    )
-      .trim()
-      .toUpperCase();
-
-    if (!rollNumber) {
-      res.writeHead(400, {
-        "Content-Type": "application/json",
+    if (
+      requestUrl.pathname === "/" &&
+      req.method === "GET"
+    ) {
+      res.writeHead(200, {
+        "Content-Type":
+          "application/json",
       });
 
       res.end(
         JSON.stringify({
-          error: "Hall Ticket Number is required.",
+          status: "ok",
+          service:
+            "JNTUH Flutter Result Proxy",
         })
       );
 
       return;
     }
 
-    try {
-      console.log(
-        `Fetching result for ${rollNumber}`
-      );
+    // ----------------------------------------------
+    // RESULT
+    // ----------------------------------------------
 
-      const result =
-        await getAcademicResult(rollNumber);
+    if (
+      requestUrl.pathname === "/api/result" &&
+      req.method === "GET"
+    ) {
+      const rollNumber = (
+        requestUrl.searchParams.get(
+          "rollNumber"
+        ) || ""
+      )
+        .trim()
+        .toUpperCase();
 
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-      });
+      if (!rollNumber) {
+        res.writeHead(400, {
+          "Content-Type":
+            "application/json",
+        });
 
-      res.end(JSON.stringify(result));
-    } catch (error) {
-      console.error(
-        "RESULT ERROR:",
-        error
-      );
+        res.end(
+          JSON.stringify({
+            error:
+              "Hall Ticket Number is required.",
+          })
+        );
 
-      res.writeHead(500, {
-        "Content-Type": "application/json",
-      });
+        return;
+      }
 
-      res.end(
-        JSON.stringify({
-          error: String(
-            error?.message || error
-          ),
-        })
-      );
+      try {
+        console.log(
+          `Fetching JNTUH result for ${rollNumber}`
+        );
+
+        const result =
+          await getAcademicResult(
+            rollNumber
+          );
+
+        res.writeHead(200, {
+          "Content-Type":
+            "application/json",
+        });
+
+        res.end(
+          JSON.stringify(result)
+        );
+      } catch (error) {
+        console.error(
+          "JNTUH RESULT ERROR:",
+          error
+        );
+
+        res.writeHead(500, {
+          "Content-Type":
+            "application/json",
+        });
+
+        res.end(
+          JSON.stringify({
+            error: String(
+              error?.message || error
+            ),
+          })
+        );
+      }
+
+      return;
     }
 
-    return;
+    // ----------------------------------------------
+    // NOT FOUND
+    // ----------------------------------------------
+
+    res.writeHead(404, {
+      "Content-Type":
+        "application/json",
+    });
+
+    res.end(
+      JSON.stringify({
+        error: "Not found",
+      })
+    );
   }
-
-  res.writeHead(404, {
-    "Content-Type": "application/json",
-  });
-
-  res.end(
-    JSON.stringify({
-      error: "Not found",
-    })
-  );
-});
+);
 
 server.listen(
   PORT,
