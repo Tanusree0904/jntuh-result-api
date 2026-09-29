@@ -3,44 +3,59 @@ const { URL } = require("url");
 
 const PORT = process.env.PORT || 10000;
 const MCP_URL = "https://jntuhresults.dhethi.com/mcp";
+const MCP_VERSION = "2025-06-18";
 
-function cors(res) {
+function addCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-async function readMcpResponse(response) {
-  const contentType = response.headers.get("content-type") || "";
+async function readResponse(response) {
+  const contentType =
+    response.headers.get("content-type") || "";
+
   const text = await response.text();
 
   if (contentType.includes("application/json")) {
+    let data = null;
+
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      data = text;
+    }
+
     return {
-      data: JSON.parse(text),
-      sessionId: response.headers.get("mcp-session-id"),
+      data,
+      sessionId:
+        response.headers.get("mcp-session-id"),
     };
   }
 
-  // Handle Server-Sent Events responses.
-  const events = [];
+  // MCP may return Server-Sent Events.
+  let lastJson = null;
 
   for (const line of text.split("\n")) {
-    if (line.startsWith("data:")) {
-      const value = line.substring(5).trim();
-
-      if (!value || value === "[DONE]") {
-        continue;
-      }
-
-      try {
-        events.push(JSON.parse(value));
-      } catch (_) {}
+    if (!line.startsWith("data:")) {
+      continue;
     }
+
+    const value = line.substring(5).trim();
+
+    if (!value || value === "[DONE]") {
+      continue;
+    }
+
+    try {
+      lastJson = JSON.parse(value);
+    } catch (_) {}
   }
 
   return {
-    data: events.length ? events[events.length - 1] : null,
-    sessionId: response.headers.get("mcp-session-id"),
+    data: lastJson,
+    sessionId:
+      response.headers.get("mcp-session-id"),
   };
 }
 
@@ -48,6 +63,7 @@ async function mcpPost(body, sessionId = null) {
   const headers = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
+    "MCP-Protocol-Version": MCP_VERSION,
   };
 
   if (sessionId) {
@@ -60,28 +76,64 @@ async function mcpPost(body, sessionId = null) {
     body: JSON.stringify(body),
   });
 
-  const parsed = await readMcpResponse(response);
+  const parsed = await readResponse(response);
 
   if (!response.ok) {
     throw new Error(
-      `MCP server returned ${response.status}: ${JSON.stringify(parsed.data)}`
+      `MCP HTTP ${response.status}: ${JSON.stringify(parsed.data)}`
     );
   }
 
   return parsed;
 }
 
-async function getResult(rollNumber) {
-  // 1. Start MCP session.
+function extractToolResult(rpc) {
+  const result = rpc?.result;
+
+  if (!result) {
+    return rpc;
+  }
+
+  // Some MCP servers return structured content.
+  if (result.structuredContent) {
+    return result.structuredContent;
+  }
+
+  // Standard MCP text content.
+  if (Array.isArray(result.content)) {
+    for (const item of result.content) {
+      if (
+        item &&
+        item.type === "text" &&
+        typeof item.text === "string"
+      ) {
+        try {
+          return JSON.parse(item.text);
+        } catch (_) {
+          return {
+            text: item.text,
+          };
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+async function getAcademicResult(rollNumber) {
+  // ---------------------------------------------
+  // 1. Initialize MCP session
+  // ---------------------------------------------
   const initialized = await mcpPost({
     jsonrpc: "2.0",
     id: 1,
     method: "initialize",
     params: {
-      protocolVersion: "2025-06-18",
+      protocolVersion: MCP_VERSION,
       capabilities: {},
       clientInfo: {
-        name: "JNTUH Flutter Proxy",
+        name: "JNTUH Flutter App",
         version: "1.0.0",
       },
     },
@@ -89,81 +141,54 @@ async function getResult(rollNumber) {
 
   const sessionId = initialized.sessionId;
 
-  // 2. Tell the server initialization is complete.
-  await mcpPost(
-    {
-      jsonrpc: "2.0",
-      method: "notifications/initialized",
-      params: {},
-    },
-    sessionId
-  );
+  // ---------------------------------------------
+  // 2. Initialization notification
+  // ---------------------------------------------
+  if (sessionId) {
+    await mcpPost(
+      {
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+        params: {},
+      },
+      sessionId
+    );
+  }
 
-  // 3. Discover the available tools.
-  const toolsResponse = await mcpPost(
+  // ---------------------------------------------
+  // 3. Call the CURRENT tool
+  //
+  // Important:
+  // The backend uses roll_no, not rollNumber.
+  // ---------------------------------------------
+  const toolResponse = await mcpPost(
     {
       jsonrpc: "2.0",
       id: 2,
-      method: "tools/list",
-      params: {},
-    },
-    sessionId
-  );
-
-  const tools = toolsResponse.data?.result?.tools || [];
-
-  const academicTool =
-    tools.find((tool) =>
-      String(tool.name).toLowerCase().includes("academic")
-    ) ||
-    tools.find((tool) =>
-      String(tool.name).toLowerCase().includes("result")
-    );
-
-  if (!academicTool) {
-    throw new Error(
-      "Could not find the academic result tool."
-    );
-  }
-
-  // Determine the argument name used by the current server.
-  const properties =
-    academicTool.inputSchema?.properties || {};
-
-  let rollKey = "rollNumber";
-
-  if (properties.roll_number) {
-    rollKey = "roll_number";
-  } else if (properties.rollNumber) {
-    rollKey = "rollNumber";
-  } else if (properties.htno) {
-    rollKey = "htno";
-  } else if (properties.rollNo) {
-    rollKey = "rollNo";
-  }
-
-  // 4. Call the actual result tool.
-  const resultResponse = await mcpPost(
-    {
-      jsonrpc: "2.0",
-      id: 3,
       method: "tools/call",
       params: {
-        name: academicTool.name,
+        name: "get_academic_result",
         arguments: {
-          [rollKey]: rollNumber,
+          roll_no: rollNumber,
         },
       },
     },
     sessionId
   );
 
-  return resultResponse.data;
+  if (toolResponse.data?.error) {
+    throw new Error(
+      JSON.stringify(toolResponse.data.error)
+    );
+  }
+
+  return extractToolResult(toolResponse.data);
 }
 
 const server = http.createServer(async (req, res) => {
-  cors(res);
+  addCors(res);
 
+  // Browser CORS preflight
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
@@ -175,7 +200,11 @@ const server = http.createServer(async (req, res) => {
     `http://${req.headers.host}`
   );
 
-  if (requestUrl.pathname === "/") {
+  // Health check
+  if (
+    requestUrl.pathname === "/" &&
+    req.method === "GET"
+  ) {
     res.writeHead(200, {
       "Content-Type": "application/json",
     });
@@ -190,6 +219,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Result endpoint
   if (
     requestUrl.pathname === "/api/result" &&
     req.method === "GET"
@@ -200,15 +230,14 @@ const server = http.createServer(async (req, res) => {
       .trim()
       .toUpperCase();
 
-    if (!/^[A-Z0-9]{10}$/.test(rollNumber)) {
+    if (!rollNumber) {
       res.writeHead(400, {
         "Content-Type": "application/json",
       });
 
       res.end(
         JSON.stringify({
-          error:
-            "Invalid hall ticket number. JNTUH hall tickets are normally 10 characters.",
+          error: "Hall Ticket Number is required.",
         })
       );
 
@@ -216,7 +245,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const result = await getResult(rollNumber);
+      console.log(
+        `Fetching result for ${rollNumber}`
+      );
+
+      const result =
+        await getAcademicResult(rollNumber);
 
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -224,7 +258,10 @@ const server = http.createServer(async (req, res) => {
 
       res.end(JSON.stringify(result));
     } catch (error) {
-      console.error(error);
+      console.error(
+        "RESULT ERROR:",
+        error
+      );
 
       res.writeHead(500, {
         "Content-Type": "application/json",
@@ -232,7 +269,9 @@ const server = http.createServer(async (req, res) => {
 
       res.end(
         JSON.stringify({
-          error: String(error.message || error),
+          error: String(
+            error?.message || error
+          ),
         })
       );
     }
@@ -251,6 +290,12 @@ const server = http.createServer(async (req, res) => {
   );
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Proxy running on port ${PORT}`);
-});
+server.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Proxy running on port ${PORT}`
+    );
+  }
+);
